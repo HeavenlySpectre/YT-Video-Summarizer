@@ -106,7 +106,7 @@ youtube_url = st.text_input("Enter YouTube Video URL:", key="youtube_url_input")
 
 # Language Selection
 lang_options = {"English": "en", "Indonesian": "id"}
-selected_lang_name = st.selectbox("Select Video Language for Transcript:", options=list(lang_options.keys()), key="lang_select")
+selected_lang_name = st.selectbox("Select Language that used in the Video for Transcript:", options=list(lang_options.keys()), key="lang_select")
 selected_lang_code = lang_options[selected_lang_name]
 
 llm_model = "openrouter/quasar-alpha"
@@ -139,7 +139,7 @@ if st.button("Summarize Video", key="summarize_button", disabled=(not youtube_ur
                 st.success(f"Transcript fetched successfully in '{actual_lang}'.")
 
                 # Join transcript text
-                transcript_joined = " ".join([line['text'] for line in transcript_data]) # Use space join
+                transcript_joined = " ".join([line.text for line in transcript_data]) # Use space join
 
                 # Display Raw Transcript (Optional)
                 with st.expander("Show Raw Transcript"):
