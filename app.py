@@ -1,11 +1,18 @@
 # app.py
 
 import streamlit as st
-import torch # Keep torch import if rpunct or its dependencies need it explicitly at global scope
+import torch
 import requests
 import re
-# Corrected import for youtube_transcript_api exceptions
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound,
+    RequestBlocked,  # Added
+    IpBlocked,       # Added
+    CouldNotRetrieveTranscript # Added
+)
 from rpunct import RestorePuncts
 from openai import OpenAI
 
@@ -20,23 +27,18 @@ def get_vid_id(url_link):
         match = re.search(pattern, url_link)
         if match:
             return match.group(1)
-    # Fallback, though the regex should cover most cases
     try:
         return url_link.split("v=")[1].split("&")[0]
     except IndexError:
         return None
 
-@st.cache_resource(show_spinner="Loading punctuation model...") # Cache the model loading
+@st.cache_resource(show_spinner="Loading punctuation model...")
 def get_punctuation_model(language='en'):
-    """Loads and returns the appropriate punctuation model."""
     if language == 'en':
         try:
-            # st.write(f"Attempting to load RPunct on CPU for language: {language}") # Debug, can be removed
             rp = RestorePuncts(device='cpu')
-            # st.write("RPunct model loaded successfully.") # Debug, can be removed
             return rp, 'rpunct'
         except Exception as e:
-            # st.write(f"RPunct loading error: {e}") # Use st.error for actual errors for visibility
             st.error(f"Error loading punctuation model (RPunct): {e}")
             st.warning(f"Could not load rpunct model (English). Proceeding without punctuation.")
             return None, None
@@ -45,10 +47,8 @@ def get_punctuation_model(language='en'):
         return None, None
 
 def punctuate_text(text, model, model_type):
-    """Applies punctuation using the loaded model."""
     if model is None or model_type is None:
         return text
-
     if model_type == 'rpunct':
         try:
             result = model.punctuate(text)
@@ -74,8 +74,6 @@ except Exception as e:
     st.error(f"Error accessing Streamlit secrets: {e}")
     api_key = st.text_input("Enter your OpenRouter API Key (Secrets Error):", type="password", key="api_key_input_fallback")
 
-
-# Initialize OpenAI Client
 client = None
 if api_key:
     try:
@@ -87,26 +85,19 @@ if api_key:
         st.error(f"Failed to initialize API Client: {e}")
         client = None
 else:
-    if "api_key_input" not in st.session_state or not st.session_state.api_key_input: # Avoid warning if field is empty but user hasn't submitted
+    if "api_key_input" not in st.session_state or not st.session_state.api_key_input:
         st.warning("Please provide your OpenRouter API Key.")
 
-
 youtube_url = st.text_input("Enter YouTube Video URL:", key="youtube_url_input")
-
-# Language Selection
 lang_options = {"English": "en", "Indonesian": "id"}
 selected_lang_name = st.selectbox("Select Language that used in the Video for Transcript:", options=list(lang_options.keys()), key="lang_select")
 selected_lang_code = lang_options[selected_lang_name]
+llm_model = "openrouter/quasar-alpha"
 
-# Summarization Model
-llm_model = "openrouter/quasar-alpha" # Consider making this configurable
-
-# Button to trigger processing
 if st.button("Summarize Video", key="summarize_button", disabled=(not youtube_url or not client)):
-
     if not youtube_url:
         st.warning("Please enter a YouTube URL.")
-    elif not client: # This check is slightly redundant due to 'disabled' but good for explicit feedback
+    elif not client:
         st.error("API Client not initialized. Please check your API Key.")
     else:
         vid_id = get_vid_id(youtube_url)
@@ -116,65 +107,52 @@ if st.button("Summarize Video", key="summarize_button", disabled=(not youtube_ur
         else:
             st.info(f"Processing Video ID: {vid_id}")
 
+            ytt_api = YouTubeTranscriptApi()
+            target_langs_priority = [] # Define for broader scope
+
             try:
                 with st.spinner("Fetching transcript..."):
-                    transcript_list = YouTubeTranscriptApi.list_transcripts(vid_id)
-                    # Define target languages for transcript fetching
-                    # Try selected language, then English as fallback, then any generated transcript in selected or English
+                    transcript_list = ytt_api.list(vid_id) # Use instance method
+                    
                     target_langs_priority = [selected_lang_code]
                     if selected_lang_code != 'en':
                         target_langs_priority.append('en')
 
-                    transcript_found = False
+                    transcript_found_obj = None
                     try:
-                        # Try finding a manually created transcript in the priority languages
-                        transcript = transcript_list.find_transcript(target_langs_priority)
-                        transcript_found = True
+                        transcript_found_obj = transcript_list.find_transcript(target_langs_priority)
                     except NoTranscriptFound:
-                        # If not found, try finding a generated transcript in the priority languages
                         try:
-                            transcript = transcript_list.find_generated_transcript(target_langs_priority)
-                            transcript_found = True
+                            transcript_found_obj = transcript_list.find_generated_transcript(target_langs_priority)
                         except NoTranscriptFound:
                             st.error(f"No transcript (manual or generated) found for video ID '{vid_id}' in the requested languages ({', '.join(target_langs_priority)}).")
-                            # Optionally, you could try to fetch *any* available transcript as a last resort
-                            # available_transcripts = transcript_list.find_manually_created_transcript(['en', 'id', ...all possible]) or find_generated_transcript
-                            transcript = None # Ensure transcript is None if not found
+                            # transcript_found_obj remains None
 
-
-                    if transcript:
-                        transcript_data = transcript.fetch()
-                        actual_lang = transcript.language_code
+                    if transcript_found_obj:
+                        transcript_data = transcript_found_obj.fetch()
+                        actual_lang = transcript_found_obj.language_code
                         st.success(f"Transcript fetched successfully in '{actual_lang}'.")
 
-                        # Join transcript text
-                        transcript_joined = " ".join([line['text'] for line in transcript_data]) # Corrected access to line['text']
+                        transcript_joined = " ".join([line['text'] for line in transcript_data])
 
-                        # Display Raw Transcript
                         with st.expander("Show Raw Transcript"):
                             st.text_area("Raw Transcript", transcript_joined, height=200)
 
-                        # Punctuating Text (Only if English)
                         punctuated_text = transcript_joined
-                        if actual_lang == 'en': # Only attempt punctuation if the actual transcript is English
-                            punc_model, punc_model_type = get_punctuation_model(actual_lang) # 'en'
-                            if punc_model and punc_model_type: # Check if a model was successfully loaded
+                        if actual_lang == 'en':
+                            punc_model, punc_model_type = get_punctuation_model(actual_lang)
+                            if punc_model and punc_model_type:
                                 with st.spinner(f"Punctuating English text... This might take a moment."):
                                     punctuated_text = punctuate_text(transcript_joined, punc_model, punc_model_type)
                         else:
                             st.info(f"Punctuation is currently applied only to English transcripts. Transcript is in '{actual_lang}'.")
 
-
-                        # Display Punctuated Text
                         with st.expander("Show (Potentially) Punctuated Transcript"):
                             st.text_area("Punctuated Transcript", punctuated_text, height=300)
 
-                        # Summarizing using LLM
                         with st.spinner(f"Summarizing using {llm_model}..."):
                             try:
-                                # Use the punctuated text for summarization
                                 text_to_summarize = punctuated_text
-
                                 completion = client.chat.completions.create(
                                     model=llm_model,
                                     messages=[
@@ -194,15 +172,27 @@ if st.button("Summarize Video", key="summarize_button", disabled=(not youtube_ur
                                 summary = completion.choices[0].message.content
                                 st.subheader("Video Summary:")
                                 st.markdown(summary)
-
                             except Exception as e:
                                 st.error(f"LLM Summarization Error: {e}")
                                 st.error("Could not generate summary. Please check the transcript length, API key, or model availability.")
+                    # else: The case where transcript_found_obj is None is handled by the NoTranscriptFound error message above.
 
+            except (RequestBlocked, IpBlocked) as e: # Specific catch for IP blocks
+                st.error("🛑 Failed to retrieve transcript: YouTube is likely blocking or rate-limiting your IP address.")
+                st.markdown(
+                    "This can happen if the app is making too many requests, or if it's hosted on a common cloud provider IP (like Streamlit Cloud). "
+                    "If you have control over the app's deployment environment (e.g., self-hosting), consider using a proxy. "
+                    "For more information, refer to the `youtube-transcript-api` library's documentation on "
+                    "[working around IP bans](https://github.com/jdepoix/youtube-transcript-api?tab=readme-ov-file#working-around-ip-bans-requestblocked-or-ipblocked-exception)."
+                )
+                st.error(f"Technical details from library: {e}")
             except TranscriptsDisabled:
                  st.error(f"Transcripts are disabled for the video: {vid_id}.")
-            except NoTranscriptFound: 
-                 st.error(f"No transcript found for video ID '{vid_id}' in the requested languages after all attempts.")
-            except Exception as e:
+            except NoTranscriptFound: # Fallback, though inner logic should catch most NoTranscriptFound cases
+                 st.error(f"No transcript ultimately found for video ID '{vid_id}' with language preferences: {', '.join(target_langs_priority if target_langs_priority else ['English'])}.")
+            except CouldNotRetrieveTranscript as e: # Catch other library-specific transcript errors
+                st.error(f"A problem occurred while trying to retrieve the transcript: {e}")
+                st.warning("Please ensure the video URL is correct, the video is public, and has transcripts available.")
+            except Exception as e: # General fallback for other unexpected errors
                 st.error(f"An unexpected error occurred during processing: {e}")
-                st.error("Could not process the video. Please double-check the URL and language availability.")
+                st.error("Could not process the video. Please double-check the URL and language settings.")
